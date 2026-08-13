@@ -5,6 +5,7 @@ import bcrypt
 import logging
 import os
 import csv
+import time
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator, ValidationError
 import re
@@ -32,12 +33,31 @@ logger = setup_logger()
 # ==========================================
 class UserSchema(BaseModel):
     username: str = Field(..., min_length=3, max_length=20)
-    password: str = Field(..., min_length=6)
+    email: str = Field(...)
+    password: str = Field(...)
     
     @field_validator('username')
     def username_alphanumeric(cls, v):
         if not re.match(r"^[a-zA-Z0-9_]+$", v):
             raise ValueError('Username must be alphanumeric.')
+        return v
+
+    @field_validator('email')
+    def validate_email(cls, v):
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", v):
+            raise ValueError('Invalid email format.')
+        return v
+
+    @field_validator('password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long.')
+        if not re.search(r"[A-Z]", v):
+            raise ValueError('Password must have at least one uppercase letter.')
+        if not re.search(r"[0-9]", v):
+            raise ValueError('Password must have at least one number.')
+        if not re.search(r"[@#$%^&*]", v):
+            raise ValueError('Password must have at least one special character (@#$%^&*).')
         return v
 
 class HardwareSchema(BaseModel):
@@ -49,15 +69,14 @@ class HardwareSchema(BaseModel):
 def init_db(db_name="hardware_inventory.db"):
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
-    # Users table for the Auth Gate
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL
         )
     """)
-    # Hardware table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS hardware (
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,10 +96,11 @@ def init_db(db_name="hardware_inventory.db"):
 class AuthController:
     def __init__(self, db_name="hardware_inventory.db"):
         self.db_name = db_name
+        self.login_attempts = {} 
 
-    def register(self, username, password):
+    def register(self, username, email, password):
         try:
-            validated = UserSchema(username=username, password=password)
+            validated = UserSchema(username=username, email=email, password=password)
         except ValidationError as e:
             msg = e.errors()[0]['msg']
             logger.warning(f"Registration validation failed: {msg}")
@@ -88,34 +108,62 @@ class AuthController:
             
         hashed_pw = bcrypt.hashpw(validated.password.encode('utf-8'), bcrypt.gensalt())
         try:
-            conn = sqlite3.connect(self.db_name)
+            # FIX APPLIED HERE: Added timeout=15 to prevent "database is locked" crashes
+            conn = sqlite3.connect(self.db_name, timeout=15)
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", 
-                           (validated.username, hashed_pw.decode('utf-8')))
+            cursor.execute("INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)", 
+                           (validated.username, validated.email, hashed_pw.decode('utf-8')))
             conn.commit()
             conn.close()
             logger.info(f"Account registered: '{validated.username}'")
             return True, "Registration successful! You may now log in."
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "email" in str(e).lower():
+                logger.warning(f"Failed registration: Email '{email}' taken.")
+                return False, "Email already registered."
             logger.warning(f"Failed registration: Username '{username}' taken.")
             return False, "Username already taken."
+        except sqlite3.OperationalError as e:
+            logger.error(f"Database lock error during registration: {e}")
+            return False, "System busy. Please try registering again in a few moments."
 
     def login(self, username, password):
         if not username or not password:
-            return False, "Please enter both fields."
+            return False, "Please enter both fields.", 0
+
+        record = self.login_attempts.get(username, {'count': 0, 'lock_time': 0})
+        current_time = time.time()
+        
+        if record['lock_time'] > current_time:
+            wait_time = int(record['lock_time'] - current_time)
+            return False, f"Account locked. Try again in {wait_time} seconds.", wait_time
             
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
-        row = cursor.fetchone()
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.db_name, timeout=15)
+            cursor = conn.cursor()
+            cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            conn.close()
+        except sqlite3.OperationalError:
+            return False, "Database is currently busy. Please try again.", 0
         
         if row and bcrypt.checkpw(password.encode('utf-8'), row[0].encode('utf-8')):
+            if username in self.login_attempts:
+                del self.login_attempts[username]
             logger.info(f"Auth Success: User '{username}' logged in.")
-            return True, "Login successful!"
+            return True, "Login successful!", 0
         else:
-            logger.warning(f"Auth Failed: Invalid attempt for '{username}'.")
-            return False, "Invalid username or password."
+            record['count'] += 1
+            if record['count'] >= 3:
+                record['lock_time'] = current_time + 30 
+                record['count'] = 0
+                self.login_attempts[username] = record
+                logger.warning(f"Account '{username}' locked out for 30 seconds.")
+                return False, "Too many failed attempts. Account locked for 30 seconds.", 30
+            else:
+                self.login_attempts[username] = record
+                logger.warning(f"Auth Failed: Invalid attempt for '{username}'.")
+                return False, f"Invalid username or password. Attempts left: {3 - record['count']}", 0
 
 class InventoryController:
     def __init__(self, db_name="hardware_inventory.db"):
@@ -130,7 +178,6 @@ class InventoryController:
         return exists
 
     def compute_status(self, qty):
-        """Computes status dynamically in the backend."""
         if qty > 5: return "In Stock"
         elif 1 <= qty <= 5: return "Low Stock"
         else: return "Out of Stock"
@@ -142,7 +189,6 @@ class InventoryController:
         return data
 
     def get_total_valuation(self):
-        """SQL aggregation query to calculate total asset value."""
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         cursor.execute("SELECT SUM(quantity * unit_price) FROM hardware")
@@ -200,7 +246,6 @@ class InventoryController:
         logger.info(f"Item ID {item_id} deleted.")
 
     def export_csv(self):
-        """Queries all records and exports them to inventory_report.csv."""
         try:
             conn = sqlite3.connect(self.db_name)
             rows = conn.execute("SELECT * FROM hardware").fetchall()
@@ -216,7 +261,7 @@ class InventoryController:
             return False, "Export failed."
 
 # ==========================================
-# 4. VIEWS (Login & Main Application)
+# 4. VIEWS (Login, Register & Dashboard)
 # ==========================================
 class HardwareApp(tk.Tk):
     def __init__(self):
@@ -225,8 +270,6 @@ class HardwareApp(tk.Tk):
         self.inv_ctrl = InventoryController()
         
         self.title("Campus Hardware System")
-        self.geometry("950x750")
-        self.center_window(950, 750)
         self.resizable(False, False)
         self.configure(bg="#f4f6f9")
         
@@ -247,10 +290,10 @@ class HardwareApp(tk.Tk):
         for widget in self.winfo_children():
             widget.destroy()
 
-    # --- AUTHENTICATION GATE ---
+    # --- 4A. LOGIN SCREEN ---
     def show_login_screen(self):
         self.clear_window()
-        self.center_window(450, 420)
+        self.center_window(450, 450) # Tighter layout for just Login
         
         header = tk.Frame(self, bg="#002147", height=85)
         header.pack(fill="x", side="top")
@@ -258,8 +301,8 @@ class HardwareApp(tk.Tk):
         tk.Label(header, text="SYSTEM AUTHENTICATION", bg="#002147", fg="#ffffff", font=("Arial", 16, "bold")).pack(pady=(25, 0))
 
         card = tk.Frame(self, bg="#ffffff", bd=1, relief="solid")
-        card.place(relx=0.5, rely=0.58, anchor="center", width=360, height=270)
-        tk.Label(card, text="Hardware Inventory Login", bg="#ffffff", fg="#333333", font=("Arial", 12, "bold")).pack(pady=(20, 15))
+        card.place(relx=0.5, rely=0.55, anchor="center", width=380, height=300)
+        tk.Label(card, text="Hardware Inventory Login", bg="#ffffff", fg="#333333", font=("Arial", 12, "bold")).pack(pady=(15, 10))
 
         f_usr = tk.Frame(card, bg="#ffffff")
         f_usr.pack(fill="x", padx=35, pady=5)
@@ -273,31 +316,100 @@ class HardwareApp(tk.Tk):
         self.ent_pass = tk.Entry(f_pwd, show="•", font=("Arial", 11), relief="solid", bg="#fafafa")
         self.ent_pass.pack(fill="x", ipady=5)
 
+        self.show_pass_var = tk.BooleanVar()
+        tk.Checkbutton(card, text="Show Password", variable=self.show_pass_var, command=self.toggle_password, bg="#ffffff", font=("Arial", 9)).pack(anchor="w", padx=35)
+
         f_btn = tk.Frame(card, bg="#ffffff")
-        f_btn.pack(fill="x", padx=35, pady=20)
-        tk.Button(f_btn, text="REGISTER", command=self.do_register, bg="#e9ecef", font=("Arial", 10, "bold"), cursor="hand2").pack(side="left", fill="x", expand=True, padx=(0, 5), ipady=5)
-        tk.Button(f_btn, text="LOGIN", command=self.do_login, bg="#0d6efd", fg="#ffffff", font=("Arial", 10, "bold"), cursor="hand2").pack(side="right", fill="x", expand=True, padx=(5, 0), ipady=5)
+        f_btn.pack(fill="x", padx=35, pady=15)
+        
+        tk.Button(f_btn, text="CREATE ACCOUNT", command=self.show_register_screen, bg="#e9ecef", font=("Arial", 9, "bold"), cursor="hand2").pack(side="left", fill="x", expand=True, padx=(0, 5), ipady=5)
+        
+        self.btn_login = tk.Button(f_btn, text="LOGIN", command=self.do_login, bg="#0d6efd", fg="#ffffff", font=("Arial", 10, "bold"), cursor="hand2")
+        self.btn_login.pack(side="right", fill="x", expand=True, padx=(5, 0), ipady=5)
+
+    # --- 4B. REGISTER SCREEN ---
+    def show_register_screen(self):
+        self.clear_window()
+        self.center_window(450, 520) # Taller layout to fit Email
+        
+        header = tk.Frame(self, bg="#002147", height=85)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+        tk.Label(header, text="SYSTEM REGISTRATION", bg="#002147", fg="#ffffff", font=("Arial", 16, "bold")).pack(pady=(25, 0))
+
+        card = tk.Frame(self, bg="#ffffff", bd=1, relief="solid")
+        card.place(relx=0.5, rely=0.55, anchor="center", width=380, height=370)
+        tk.Label(card, text="Create New Account", bg="#ffffff", fg="#333333", font=("Arial", 12, "bold")).pack(pady=(15, 10))
+
+        f_usr = tk.Frame(card, bg="#ffffff")
+        f_usr.pack(fill="x", padx=35, pady=5)
+        tk.Label(f_usr, text="Username:", bg="#ffffff", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.ent_user = tk.Entry(f_usr, font=("Arial", 11), relief="solid", bg="#fafafa")
+        self.ent_user.pack(fill="x", ipady=5)
+
+        f_eml = tk.Frame(card, bg="#ffffff")
+        f_eml.pack(fill="x", padx=35, pady=5)
+        tk.Label(f_eml, text="Email Address:", bg="#ffffff", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.ent_email = tk.Entry(f_eml, font=("Arial", 11), relief="solid", bg="#fafafa")
+        self.ent_email.pack(fill="x", ipady=5)
+
+        f_pwd = tk.Frame(card, bg="#ffffff")
+        f_pwd.pack(fill="x", padx=35, pady=5)
+        tk.Label(f_pwd, text="Password:", bg="#ffffff", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.ent_pass = tk.Entry(f_pwd, show="•", font=("Arial", 11), relief="solid", bg="#fafafa")
+        self.ent_pass.pack(fill="x", ipady=5)
+
+        self.show_pass_var = tk.BooleanVar()
+        tk.Checkbutton(card, text="Show Password", variable=self.show_pass_var, command=self.toggle_password, bg="#ffffff", font=("Arial", 9)).pack(anchor="w", padx=35)
+
+        f_btn = tk.Frame(card, bg="#ffffff")
+        f_btn.pack(fill="x", padx=35, pady=15)
+        
+        tk.Button(f_btn, text="BACK TO LOGIN", command=self.show_login_screen, bg="#e9ecef", font=("Arial", 9, "bold"), cursor="hand2").pack(side="left", fill="x", expand=True, padx=(0, 5), ipady=5)
+        tk.Button(f_btn, text="REGISTER", command=self.do_register, bg="#198754", fg="#ffffff", font=("Arial", 10, "bold"), cursor="hand2").pack(side="right", fill="x", expand=True, padx=(5, 0), ipady=5)
+
+    def toggle_password(self):
+        if self.show_pass_var.get():
+            self.ent_pass.config(show="")
+        else:
+            self.ent_pass.config(show="•")
+
+    def start_lockout_timer(self, wait_time):
+        if not hasattr(self, 'btn_login') or not self.btn_login.winfo_exists():
+            return
+            
+        if wait_time > 0:
+            self.btn_login.config(state="disabled", text=f"LOCKED ({wait_time}s)", bg="#6c757d")
+            self.after(1000, self.start_lockout_timer, wait_time - 1)
+        else:
+            self.btn_login.config(state="normal", text="LOGIN", bg="#0d6efd")
 
     def do_login(self):
         u, p = self.ent_user.get().strip(), self.ent_pass.get().strip()
-        success, msg = self.auth_ctrl.login(u, p)
+        success, msg, wait_time = self.auth_ctrl.login(u, p)
+        
         if success:
             self.current_user = u
             self.show_main_dashboard()
+        elif wait_time > 0:
+            self.start_lockout_timer(wait_time)
+            messagebox.showwarning("Account Locked", msg)
         else:
-            messagebox.showerror("Error", msg)
+            messagebox.showerror("Auth Alert", msg)
 
     def do_register(self):
-        u, p = self.ent_user.get().strip(), self.ent_pass.get().strip()
-        success, msg = self.auth_ctrl.register(u, p)
+        u = self.ent_user.get().strip()
+        e = self.ent_email.get().strip()
+        p = self.ent_pass.get().strip()
+        
+        success, msg = self.auth_ctrl.register(u, e, p)
         if success:
             messagebox.showinfo("Success", msg)
-            self.ent_user.delete(0, tk.END)
-            self.ent_pass.delete(0, tk.END)
+            self.show_login_screen() # Redirects the user back to the login page
         else:
             messagebox.showwarning("Registration Failed", msg)
 
-    # --- MAIN INVENTORY DASHBOARD ---
+    # --- 4C. MAIN INVENTORY DASHBOARD ---
     def show_main_dashboard(self):
         self.clear_window()
         self.center_window(1000, 780)
@@ -309,15 +421,12 @@ class HardwareApp(tk.Tk):
         style.configure("Treeview.Heading", background="#e9ecef", font=("Arial", 11, "bold"))
         style.map('Treeview', background=[('selected', '#ffffff')], foreground=[('selected', '#000000')])
 
-        # Header with Valuation & Logout
         head_frame = tk.Frame(self, bg="#002147", height=60)
         head_frame.pack(fill="x")
         self.lbl_valuation = tk.Label(head_frame, text="Total Asset Valuation: $0.00", bg="#002147", fg="#58d68d", font=("Arial", 14, "bold"))
         self.lbl_valuation.pack(side="left", padx=20, pady=15)
-        
         tk.Button(head_frame, text="LOGOUT", command=self.do_logout, bg="#dc3545", fg="white", font=("Arial", 10, "bold"), relief="flat", cursor="hand2").pack(side="right", padx=20, pady=15)
 
-        # Form Section
         form_f = tk.LabelFrame(self, text=" Add New Hardware ", bg="#f4f6f9", fg="#002147", font=("Arial", 12, "bold"), pady=10, padx=15)
         form_f.pack(fill="x", padx=20, pady=15)
 
@@ -345,7 +454,6 @@ class HardwareApp(tk.Tk):
         
         self.ent_h_name.bind("<KeyRelease>", self.realtime_duplicate_check)
 
-        # Data Grid
         grid_f = tk.Frame(self, bg="#ffffff", bd=1, relief="solid")
         grid_f.pack(fill="both", expand=True, padx=20, pady=5)
 
@@ -360,7 +468,6 @@ class HardwareApp(tk.Tk):
             self.tree.heading(col, text=head)
             self.tree.column(col, width=w, anchor="center")
 
-        # Color Tags for Stock Level
         self.tree.tag_configure("Out of Stock", background="#f8d7da", foreground="#000000")
         self.tree.tag_configure("Low Stock", background="#ffe5b4", foreground="#000000")
         self.tree.tag_configure("In Stock", background="#d4edda", foreground="#000000")
@@ -369,7 +476,6 @@ class HardwareApp(tk.Tk):
         self.tree.bind("<ButtonRelease-1>", self.on_row_click)
         self.tree.pack(fill="both", expand=True)
 
-        # Bottom Panel (Update/Delete/Export)
         btm_f = tk.LabelFrame(self, text=" Manage Inventory ", bg="#f4f6f9", fg="#002147", font=("Arial", 12, "bold"), pady=10, padx=15)
         btm_f.pack(fill="x", padx=20, pady=15)
 
@@ -383,7 +489,6 @@ class HardwareApp(tk.Tk):
 
         tk.Button(btm_f, text="UPDATE", command=self.do_update, bg="#0d6efd", fg="white", font=("Arial", 10, "bold"), width=10).grid(row=0, column=4, padx=15)
         tk.Button(btm_f, text="DELETE", command=self.do_delete, bg="#dc3545", fg="white", font=("Arial", 10, "bold"), width=10).grid(row=0, column=5, padx=15)
-        
         tk.Button(btm_f, text="EXPORT TO CSV", command=self.do_export, bg="#212529", fg="white", font=("Arial", 10, "bold")).grid(row=0, column=6, padx=(50,0))
 
         self.auto_refresh()
@@ -476,10 +581,8 @@ class HardwareApp(tk.Tk):
                 
             self.tree.insert("", "end", values=(tick, db_id, name, cat, qty, price_fmt, status), tags=(tag,))
             
-        # Update Total Valuation Banner
         total_val = self.inv_ctrl.get_total_valuation()
         self.lbl_valuation.config(text=f"Total Asset Valuation: ${total_val:,.2f}")
-        
         self.realtime_duplicate_check()
 
     def auto_refresh(self):
